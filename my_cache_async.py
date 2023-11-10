@@ -8,6 +8,7 @@ import asyncio
 import aiofiles
 import aiofiles.os
 import random
+import aiojobs
 
 class my_persistent_cache:
 
@@ -37,13 +38,23 @@ class my_persistent_cache:
     else:
       if not os.path.isdir(os.path.dirname(self.db_file)):
         os.makedirs(os.path.dirname(self.db_file))
-    
-    #очередь для записи в файл [пока не используется]
-    self.queue = asyncio.Queue()
 
     # словарь блокировок для каждого хеша, 
     # нужен для того чтобы при работе с одним и тем же хешом не произошла повторная обработка, пока не завершена первая
     self.dict_lock = {}
+    self.scheduler = None
+    self.job = None
+
+  def start_scheduler(self):
+    if self.scheduler is None:
+      self.scheduler = aiojobs.Scheduler()
+
+  async def join(self):
+    if self.job is not None:
+      await self.job.wait()
+    if self.scheduler is not None:
+      await self.scheduler.close()
+
 
   def __generate_hash(self,*args,**kwargs)->tuple[str,str]:
     '''
@@ -65,37 +76,29 @@ class my_persistent_cache:
       
     full_path = os.path.join(folder, hash_string)
 
-    #[пока отключено] делаем блокировку пока работаем с определенным хешом
-    #async with self.dict_lock.get(full_path, asyncio.Lock()):
-    if not await aiofiles.os.path.isdir(os.path.dirname(full_path)):
-      await aiofiles.os.makedirs(os.path.dirname(full_path))
+    self.my_log(f'check {full_path}')
+    #делаем блокировку пока работаем с определенным хешом
+    async with self.dict_lock.get(full_path, asyncio.Lock()):
+      if not await aiofiles.os.path.isdir(os.path.dirname(full_path)):
+        await aiofiles.os.makedirs(os.path.dirname(full_path))
 
-    async with aiofiles.open(full_path,'w',encoding='UTF-8') as f:
-      await f.write(result)
+      self.my_log(f'create {full_path}')
+      async with aiofiles.open(full_path,'w',encoding='UTF-8') as f:
+        await f.write(result)
 
-    #[предположим что запись на диск это долгая операция, поэтому хотелось бы ее вынести в отедельный поток]
-    await asyncio.sleep(3)
-    
-    self.my_log(f'update {self.db_file}')
-    async with aiofiles.open(self.db_file,'a',encoding='UTF-8') as f:
-      await f.write(f'{full_path}\t{arg_string}\n')
+      #[предположим что запись на диск это долгая операция]
+      #await asyncio.sleep(3)
+      
+      self.my_log(f'update {self.db_file}')
+      async with aiofiles.open(self.db_file,'a',encoding='UTF-8') as f:
+        await f.write(f'{full_path}\t{arg_string}\n')
 
-    # очищаем словарь с данными из памяти (далеее чтение должно происходить только из файла)
-    if full_path in self.__mem_storage_data:
-      del self.__mem_storage_data[full_path]
+      # очищаем словарь с данными из памяти (далеее чтение должно происходить только из файла)
+      if full_path in self.__mem_storage_data:
+        del self.__mem_storage_data[full_path]
 
-    #сохраняем информацию о том что уже записали в файл, дальше будем проверять по этому ключу, чтобы читать с диска
-    self.__mem_storage_meta[full_path] = arg_string
-
-  async def consumer_on_queue_for_write_data(self):
-    # [метод пока не используется]
-    while True:
-      # из очереди должны получить данные, которые необходимо записать в файл
-      item = await self.queue.get()
-      #распаковываем данные:
-      folder, arg_string, hash_string, result = item
-
-      await self.__save_data_to_disk(folder, arg_string, hash_string, result)
+      #сохраняем информацию о том что уже записали в файл, дальше будем проверять по этому ключу, чтобы читать с диска
+      self.__mem_storage_meta[full_path] = arg_string
 
   def my_log(self,message):
     if self.is_debug_log:
@@ -110,6 +113,7 @@ class my_persistent_cache:
   def async_cache(self, folder):
     def wrap_function(func):
       async def wrapper(*args, **kwargs):
+          self.start_scheduler()
           self.my_log('start async_cache')
 
           arg_string, hash_string = self.__generate_hash(*args,**kwargs)
@@ -147,21 +151,24 @@ class my_persistent_cache:
             # иначе вызываем функцию
 
             coroutin_func = func(*args, **kwargs)
-            #asyncio.gather(coroutin_func)
             result = await coroutin_func
             
             # до тех пор пока результат функции не записали на диск держим в памяти
-            self.__mem_storage_data[hash_string] = result
+            self.__mem_storage_data[full_path] = result
             
-            #[тут хотелось бы сделать запись в файл (вызвать функцию __save_data_to_disk) в отдельном потоке, неблокируя основную работы программы]
-            #self.queue.put((folder,arg_string, hash_string,result))
-            
-            #[сейчас сохранение на диск вызывается в том же потоке]
-            await self.__save_data_to_disk(folder,arg_string, hash_string, result)
+            coroutin_save = self.__save_data_to_disk(folder,arg_string, hash_string, result)
+
+            self.job = await self.scheduler.spawn(coroutin_save)
 
           return result
       return wrapper
     return wrap_function
+
+#предварительно очищаем кэш
+# if os.path.isfile('cache\\my.db'):
+#   os.remove('cache\\my.db')
+# for file in os.listdir('cache\\example'):
+#   os.remove('cache\\example\\'+file)
 
 cache_stor = my_persistent_cache(db_file='cache\\my.db',is_debug_log=True)
 
@@ -180,17 +187,18 @@ async def main():
       example('param2',param3=True, param2=False),
       example('param3',param3=True, param2=False),
       example('param1',param3=True, param2=False),
+      example('param1',param3=True, param2=False),
+      example('param1',param3=True, param2=False),
+      example('param2',param3=True, param2=False),
+      example('param3',param3=True, param2=False),
+      example('param1',param3=True, param2=False),
   ]
 
   resluts = await asyncio.gather(*tasks)
 
-#if __name__ == '__main__':
+  await cache_stor.join()
 
-  # #предварительно очищаем кэш
-  # if os.path.isfile('cache\\my.db'):
-  #   os.remove('cache\\my.db')
-  # for file in os.listdir('cache\\example'):
-  #   os.remove('cache\\example\\'+file)
-  
+  print('all done ')
 
-asyncio.run(main())
+if __name__ == '__main__':
+  asyncio.run(main())
