@@ -9,6 +9,7 @@ import aiofiles
 import aiofiles.os
 import random
 import aiojobs
+import pickle
 
 class my_persistent_cache:
 
@@ -42,6 +43,9 @@ class my_persistent_cache:
     # словарь блокировок для каждого хеша, 
     # нужен для того чтобы при работе с одним и тем же хешом не произошла повторная обработка, пока не завершена первая
     self.dict_lock = {}
+
+    #короткая блокировка, которая нужна для проверки и записи в dict_lock
+    self.lock = asyncio.Lock() 
     self.scheduler = None
     self.job = None
 
@@ -55,15 +59,21 @@ class my_persistent_cache:
     if self.scheduler is not None:
       await self.scheduler.close()
 
-
-  def __generate_hash(self,*args,**kwargs)->tuple[str,str]:
+  def generate_hash_new(self,*args,**kwargs)->tuple[str,str]:
     '''
     функция создает хэш из параметров, возвращает str аргументов и хеш
     '''
-    all_args = {
-      'args':args,
-      'kwargs':kwargs,
-    }
+    all_args = [args,kwargs]
+    serialized_data = pickle.dumps(all_args,)
+    hash_string = hashlib.sha256(serialized_data).hexdigest()
+    arg_string = 'empty'
+    return arg_string,hash_string
+
+  def generate_hash(self,*args,**kwargs)->tuple[str,str]:
+    '''
+    функция создает хэш из параметров, возвращает str аргументов и хеш
+    '''
+    all_args = [args,kwargs]
     arg_string = json.dumps(all_args, sort_keys=True)
     arg_string_e = arg_string.encode()
     hash_string = hashlib.sha256(arg_string_e).hexdigest()
@@ -116,15 +126,15 @@ class my_persistent_cache:
           self.start_scheduler()
           self.my_log('start async_cache')
 
-          arg_string, hash_string = self.__generate_hash(*args,**kwargs)
+          arg_string, hash_string = self.generate_hash_new(*args,**kwargs)
           self.my_log(f'{hash_string=}')
 
           full_path = os.path.join(folder, hash_string)
-          
-          if full_path not in self.dict_lock:
-            self.my_log('create lock')
-            #создаем блокировку для уникального хеша
-            self.dict_lock[full_path] = asyncio.Lock()
+          async with self.lock:
+            if full_path not in self.dict_lock:
+              self.my_log('create lock')
+              #создаем блокировку для уникального хеша
+              self.dict_lock[full_path] = asyncio.Lock()
 
           self.my_log(f'{self.dict_lock=}')
           #ставим блокировку, пока пытаемся прочитать данные в памяти и если нет, то записываем на диск
@@ -148,8 +158,7 @@ class my_persistent_cache:
             if not asyncio.iscoroutinefunction(func):
                 raise(Exception(f'function {func.__name__} must be mark as async'))
             
-            # иначе вызываем функцию
-
+            #вызываем функцию
             coroutin_func = func(*args, **kwargs)
             result = await coroutin_func
             
@@ -196,6 +205,8 @@ async def main():
 
   resluts = await asyncio.gather(*tasks)
 
+  # после завершения основного цикла, ожидаем когда завершится
+  # цикл кеша, чтобы успел всё записать на диск прежде чем выйти из программы 
   await cache_stor.join()
 
   print('all done ')
