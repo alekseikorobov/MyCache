@@ -1,7 +1,5 @@
-import hashlib
-import json
+from my_cache.serialise.Serialise import SerialiseBin,SerialiseJson
 from enum import Enum
-import pandas as pd
 import os
 import time
 import asyncio
@@ -9,14 +7,24 @@ import aiofiles
 import aiofiles.os
 import random
 import aiojobs
-import pickle
 
-class my_persistent_cache:
 
-  def __init__(self,db_file = None, is_debug_log=False):
+
+class TypeStorage(Enum):
+  IN_MEMORY = 0
+  IN_DISK = 1
+
+class CacheStor:
+  def __init__(self, type_storage=TypeStorage.IN_MEMORY,db_file = None, is_debug_log=False,serialiser=None):
+    self.type_storage = type_storage
     self.db_file = db_file
     self.is_debug_log = is_debug_log
     
+    if serialiser is None:
+      self.serialiser=SerialiseBin()
+    else:
+      self.serialiser=serialiser
+ 
     # кеш для временного хранения данных, до тех пор пока эти данные не записали в файл,
     # после записи в файл, очищаем словарь по хешу
     self.__mem_storage_data = {}
@@ -24,21 +32,28 @@ class my_persistent_cache:
     # кеш для хранения хеша, чтобы понимать существует ли файл с таким ключом или нет (чтобы лишний раз не проверять на диске)
     self.__mem_storage_meta = {}
 
-    if self.db_file is None or self.db_file == '':
-      raise(Exception('parameter db_file is cannot be empty!'))
+    all_func_for_storage = {
+      TypeStorage.IN_DISK:self.__get_or_run_with_store_disk,
+      TypeStorage.IN_MEMORY:self.__get_or_run_with_store_memory,
+    }
 
-    if os.path.isfile(self.db_file):
-      self.my_log(f'read from {self.db_file}')
-      with open(self.db_file,'r',encoding='UTF-8') as f:
-        for line in f.readlines():
-          line = line.rstrip('\n')
-          full_path,arg_string = line.split('\t')
-          self.my_log(f'{full_path} - {arg_string=}')
-          self.__mem_storage_meta[full_path] = arg_string
-      self.my_log(f'not keys {len(self.__mem_storage_meta)}')
-    else:
-      if not os.path.isdir(os.path.dirname(self.db_file)):
-        os.makedirs(os.path.dirname(self.db_file))
+    self.__func_storage = all_func_for_storage[self.type_storage]
+
+    if self.type_storage == TypeStorage.IN_DISK:
+      if self.db_file is None or self.db_file == '':
+        raise(Exception('if type TypeStorage.IN_DISK then db_file is cannot be empty!'))
+      if os.path.isfile(self.db_file):
+        self.my_log(f'read from {self.db_file}')
+        with open(self.db_file,'r',encoding='UTF-8') as f:
+          for line in f.readlines():
+            line = line.rstrip('\n')
+            full_path,arg_string = line.split('\t')
+            self.my_log(f'{full_path} - {arg_string=}')
+            self.__mem_storage_meta[full_path] = arg_string
+        self.my_log(f'not keys {len(self.__mem_storage_meta)}')
+      else:
+        if not os.path.isdir(os.path.dirname(self.db_file)):
+          os.makedirs(os.path.dirname(self.db_file))
 
     # словарь блокировок для каждого хеша, 
     # нужен для того чтобы при работе с одним и тем же хешом не произошла повторная обработка, пока не завершена первая
@@ -48,38 +63,9 @@ class my_persistent_cache:
     self.lock = asyncio.Lock() 
     self.scheduler = None
     self.job = None
-
-  def start_scheduler(self):
-    if self.scheduler is None:
-      self.scheduler = aiojobs.Scheduler()
-
-  async def join(self):
-    if self.job is not None:
-      await self.job.wait()
-    if self.scheduler is not None:
-      await self.scheduler.close()
-
-  def generate_hash_new(self,*args,**kwargs)->tuple[str,str]:
-    '''
-    функция создает хэш из параметров, возвращает str аргументов и хеш
-    '''
-    all_args = [args,kwargs]
-    serialized_data = pickle.dumps(all_args,)
-    hash_string = hashlib.sha256(serialized_data).hexdigest()
-    arg_string = 'empty'
-    return arg_string,hash_string
-
-  def generate_hash(self,*args,**kwargs)->tuple[str,str]:
-    '''
-    функция создает хэш из параметров, возвращает str аргументов и хеш
-    '''
-    all_args = [args,kwargs]
-    arg_string = json.dumps(all_args, sort_keys=True)
-    arg_string_e = arg_string.encode()
-    hash_string = hashlib.sha256(arg_string_e).hexdigest()
-    return arg_string,hash_string
-  
-  async def __save_data_to_disk(self, folder, arg_string, hash_string, result):
+    
+      
+  async def __save_data_to_disk_async(self, folder, arg_string, hash_string, result):
     # делаем запись данных
     
     self.my_log('start __save_data_to_disk')
@@ -93,11 +79,12 @@ class my_persistent_cache:
         await aiofiles.os.makedirs(os.path.dirname(full_path))
 
       self.my_log(f'create {full_path}')
+      
       async with aiofiles.open(full_path,'w',encoding='UTF-8') as f:
         await f.write(result)
 
       #[предположим что запись на диск это долгая операция]
-      #await asyncio.sleep(3)
+      #await asyncio.sleep(10)
       
       self.my_log(f'update {self.db_file}')
       async with aiofiles.open(self.db_file,'a',encoding='UTF-8') as f:
@@ -119,14 +106,65 @@ class my_persistent_cache:
       except RuntimeError:
         pass
       print(f'{task_name}: {message}')
+  
+  def __get_or_run_with_store_disk(self, folder, hash_string, arg_string, func,*args,**kwargs):
+    full_path = os.path.join(folder, hash_string)
+    if full_path in self.__mem_storage_meta:
+      if not os.path.isfile(full_path):
+        raise(Exception(f'not found file by path {full_path}'))
+      result = None
+      with open(full_path,'r',encoding='UTF-8') as f:
+        result = f.read()
+      self.my_log(f'read from cache {full_path}')
+      return result
+    else:
+      result = func(*args,**kwargs)
+      self.__mem_storage_meta[full_path] = arg_string
+      self.my_log(f'save to {full_path}')
+      
+      if not os.path.isdir(os.path.dirname(full_path)):
+         os.makedirs(os.path.dirname(full_path))
 
-  def async_cache(self, folder):
+      with open(full_path,'w',encoding='UTF-8') as f:
+        f.write(result)
+      self.my_log(f'update {self.db_file}')
+      with open(self.db_file,'a',encoding='UTF-8') as f:
+        f.write(f'{full_path}\t{arg_string}\n')
+      return result
+
+  def __get_or_run_with_store_memory(self,folder, hash_string, arg_string,func,*args,**kwargs):
+    if hash_string in self.__mem_storage_meta:
+      return self.__mem_storage_meta[hash_string]
+    else:
+      result = func(*args,**kwargs)
+      self.__mem_storage_meta[hash_string] = result
+      return result
+
+  def cache(self,folder:str):
+    def wrap_function(func):
+      def wrapper(*args,**kwargs):
+        arg_string, hash_string = self.serialiser.encode(*args,**kwargs)
+        self.my_log(self.type_storage)
+        return self.__func_storage(folder, hash_string, arg_string,func,*args,**kwargs)
+      return wrapper
+    return wrap_function
+
+  def start_scheduler(self):
+    if self.scheduler is None:
+      self.scheduler = aiojobs.Scheduler()
+
+  async def join(self):
+    if self.job is not None:
+      await self.job.wait()
+    if self.scheduler is not None:
+      await self.scheduler.close()
+  def cache_async(self, folder:str):
     def wrap_function(func):
       async def wrapper(*args, **kwargs):
           self.start_scheduler()
           self.my_log('start async_cache')
 
-          arg_string, hash_string = self.generate_hash_new(*args,**kwargs)
+          arg_string, hash_string = self.serialiser.encode(*args,**kwargs)
           self.my_log(f'{hash_string=}')
 
           full_path = os.path.join(folder, hash_string)
@@ -165,7 +203,7 @@ class my_persistent_cache:
             # до тех пор пока результат функции не записали на диск держим в памяти
             self.__mem_storage_data[full_path] = result
             
-            coroutin_save = self.__save_data_to_disk(folder,arg_string, hash_string, result)
+            coroutin_save = self.__save_data_to_disk_async(folder,arg_string, hash_string, result)
 
             self.job = await self.scheduler.spawn(coroutin_save)
 
@@ -173,43 +211,8 @@ class my_persistent_cache:
       return wrapper
     return wrap_function
 
-#предварительно очищаем кэш
-# if os.path.isfile('cache\\my.db'):
-#   os.remove('cache\\my.db')
-# for file in os.listdir('cache\\example'):
-#   os.remove('cache\\example\\'+file)
 
-cache_stor = my_persistent_cache(db_file='cache\\my.db',is_debug_log=True)
-
-@cache_stor.async_cache(folder='cache\\example')
-async def example(param1:str,param2:str = False,param3:str = False):
-  print(f'nested {param1=},{param2=},{param3=}')
-  sleep = random.choice([1,2,3])
-  print(f'start sleep - {sleep}')
-  await asyncio.sleep(sleep)
-  return f'{param1=},{param2=},{param3=}'
-
-async def main():
-  tasks = [
-      example('param1',param3=True, param2=False),
-      example('param1',param3=True, param2=False),
-      example('param2',param3=True, param2=False),
-      example('param3',param3=True, param2=False),
-      example('param1',param3=True, param2=False),
-      example('param1',param3=True, param2=False),
-      example('param1',param3=True, param2=False),
-      example('param2',param3=True, param2=False),
-      example('param3',param3=True, param2=False),
-      example('param1',param3=True, param2=False),
-  ]
-
-  resluts = await asyncio.gather(*tasks)
-
-  # после завершения основного цикла, ожидаем когда завершится
-  # цикл кеша, чтобы успел всё записать на диск прежде чем выйти из программы 
-  await cache_stor.join()
-
-  print('all done ')
-
-if __name__ == '__main__':
-  asyncio.run(main())
+# if __name__ == '__main__':
+#   serialise = Serialise()
+  
+#   print(serialise.encode(1,2))

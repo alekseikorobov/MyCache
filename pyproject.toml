@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "my-cache"
+version = "0.1.0"
+description = "decorator cache for save data from result function"
+authors = ["aleksei korobov <aleksei_korobov@mail.ru>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+aiofiles = "^23.2.1"
+aiojobs = "^1.2.0"
+setuptools = "^68.2.2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
