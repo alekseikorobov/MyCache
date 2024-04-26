@@ -1,7 +1,12 @@
 # MyCache
 Декоратор для автоматического кеширования данных
 
-Пример использования:
+### Установка
+```sh
+pip install -e git+https://github.com/alekseikorobov/MyCache.git
+```
+
+### Пример использования:
 ```python
 from my_cache import CacheStor, TypeStorage
 
